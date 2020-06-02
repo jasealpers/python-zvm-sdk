@@ -631,6 +631,8 @@ class SMTClient(object):
             flashimage_info = self._FlashImageDbOperator.flashimage_query_record(image_name)
         except exception.SDKObjectNotExistError:
             haveFlash=False
+        LOG.info(haveFlash)
+        LOG.info(flashimage_info)
 
         if haveFlash:
             # Flashcopy disk
@@ -673,6 +675,24 @@ class SMTClient(object):
 
         # Punch transport files if specified
         if transportfiles:
+            self.guest_send(userid, transportfiles, remotehost)
+
+        # Authorize iucv client
+        self.guest_authorize_iucv_client(userid)
+        # Update os version in guest metadata
+        # TODO: may should append to old metadata, not replace
+      
+        # TODO: These commented out lines need to pull correctly from flashimage or image depending
+        #image_info = self._ImageDbOperator.image_query_record(image_name)
+        #metadata = 'os_version=%s' % image_info[0]['imageosdistro']
+        #self._GuestDbOperator.update_guest_by_userid(userid, meta=metadata)
+
+        msg = ('Deploy image %(img)s to guest %(vm)s disk %(vdev)s'
+               ' successfully' % {'img': image_name, 'vm': userid,
+                                  'vdev': vdev})
+        LOG.info(msg)
+
+    def guest_send(self, userid, transportfiles, remotehost=None, configparms=None, executeimmediate=None):
             # Copy transport file to local
             msg = ('Start to send customized file to vm %s' % userid)
             LOG.info(msg)
@@ -699,27 +719,40 @@ class SMTClient(object):
                     raise exception.SDKGuestOperationError(rs=4, userid=userid,
                                                            err_info=err_msg)
 
+                # Customize the script with the given parms
+                if configparms:
+                    cmd = ['/bin/sed', '-i']
+                    for parm in configparms:
+                        key = parm.get('key')
+                        value = parm.get('value').replace('\n','\\n').replace('/','\\/')
+                        cmd.append('-e')
+                        cmd.append(('s/${%s}/%s/g' % (key, value)))
+                    cmd.append(local_trans)
+                    LOG.info(cmd)
+
+                    with zvmutils.expect_and_reraise_internal_error(modID='guest'):
+                        (rc, output) = zvmutils.execute(cmd)
+                    if rc != 0:
+                        err_msg = ('customize script failed with output: %(res)s' %
+                                   {'res': output})
+                        LOG.error(err_msg)
+                        raise exception.SDKGuestOperationError(rs=4, userid=userid,
+                                                               err_info=err_msg)
+		
                 # Punch config drive to guest userid
                 rd = ("changevm %(uid)s punchfile %(file)s --class X" %
                       {'uid': userid, 'file': local_trans})
                 action = "punch config drive to userid '%s'" % userid
                 with zvmutils.log_and_reraise_smt_request_failed(action):
                     self._request(rd)
+
+                # Trigger do-script if requested and the guest is up
+                if executeimmediate and self.get_power_state(userid) == 'on':
+                    self.execute_cmd(userid, "/usr/bin/zvmguestconfigure start")
+
             finally:
                 # remove the local temp config drive folder
                 self._pathutils.clean_temp_folder(tmp_trans_dir)
-        # Authorize iucv client
-        self.guest_authorize_iucv_client(userid)
-        # Update os version in guest metadata
-        # TODO: may should append to old metadata, not replace
-        image_info = self._ImageDbOperator.image_query_record(image_name)
-        metadata = 'os_version=%s' % image_info[0]['imageosdistro']
-        self._GuestDbOperator.update_guest_by_userid(userid, meta=metadata)
-
-        msg = ('Deploy image %(img)s to guest %(vm)s disk %(vdev)s'
-               ' successfully' % {'img': image_name, 'vm': userid,
-                                  'vdev': vdev})
-        LOG.info(msg)
 
     def guest_capture(self, userid, image_name, capture_type='rootonly',
                       compress_level=6):
